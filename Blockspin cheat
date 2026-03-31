@@ -357,7 +357,7 @@ local function teleportTo(name)
     warn("[BS] Teleported to " .. name)
 end
 
--- QUEST CLAIM (reads actual quest data, only claims COMPLETED + UNCLAIMED)
+-- QUEST CLAIM (reads actual quest data + brute-force ALL including quests)
 local function claimAll()
     if not GR then warn("[BS] No Get remote"); return end
     local claimed = 0
@@ -369,8 +369,9 @@ local function claimAll()
         if D and D.active_quests then
             gotData = true
             for questKey, questInfo in pairs(D.active_quests) do
-                if questInfo.completed and not questInfo.claimed then
-                    task.wait(0.2)
+                -- Try to claim ALL quests, not just completed ones
+                if not questInfo.claimed then
+                    task.wait(0.15)
                     local ok, result = pcall(function()
                         return GR:InvokeServer("claim_quest", questKey)
                     end)
@@ -383,28 +384,89 @@ local function claimAll()
         end
     end)
 
-    -- Method 2: If Data module failed, brute-force with correct milestone names
-    if not gotData then
-        warn("[BS] Data module unavailable, brute-forcing...")
-        -- These are the ACTUAL milestone names from the dump (SkillsList children)
-        local milestones = {
-            "stamina", "janitor", "cook", "shelf_stocker",
-            "atm_hacker", "total_level", "farmer", "fishing",
-            "pistol", "rifle", "shotgun"
-        }
-        for _, m in ipairs(milestones) do
-            for i = 1, 15 do
-                local key = m .. "_" .. i
-                task.wait(0.15)
-                pcall(function() GR:InvokeServer("claim_quest", key) end)
+    -- Method 2: Brute-force ALL milestone names from dump (skills + quests)
+    -- Includes quest milestones (mopping, join_for_num_days, etc)
+    warn("[BS] Brute-forcing all milestones...")
+    local milestones = {
+        -- Skill milestones (from SkillsList children)
+        "stamina", "janitor", "cook", "shelf_stocker",
+        "atm_hacker", "total_level", "farmer", "fishing",
+        "pistol", "rifle", "shotgun",
+        -- Quest milestones (from QuestsData/Milestones children)
+        "mopping", "play_for_length", "join_for_num_days",
+        "work_num_jobs", "mj", "pro_skimmer",
+        "death_by_distance", "shoe_kiss", "headbutt",
+        "baseball_bat", "slap", "stomp_execution",
+        "execution_1", "execution_2", "execution_3",
+        "driving_vehicle"
+    }
+    for _, m in ipairs(milestones) do
+        for i = 1, 20 do
+            local key = m .. "_" .. i
+            task.wait(0.08)
+            local ok, result = pcall(function()
+                return GR:InvokeServer("claim_quest", key)
+            end)
+            if ok and result then
+                claimed = claimed + 1
+                warn("[BS] ✓ Claimed: " .. key)
             end
         end
     end
 
     if claimed > 0 then
-        warn("[BS] ✓ Claimed " .. claimed .. " quests!")
+        warn("[BS] ✓ Claimed " .. claimed .. " quests total!")
     else
-        warn("[BS] No claimable quests found (must complete them first)")
+        warn("[BS] No claimable quests found")
+    end
+end
+
+-- LEVEL BYPASS (hooks SkillsList.has_skill to always return true)
+local function setLevelBypass(on)
+    en.lvlbypass = on
+    if on then
+        pcall(function()
+            local SL = require(RS.Modules.Game.Skills.SkillsList)
+            if SL then
+                -- Override has_skill to always return true
+                SL.has_skill = function(_, _, _)
+                    return true, {level = 999}
+                end
+                -- Refresh the shop UI if it's open
+                pcall(function()
+                    local CBU = require(RS.Modules.Game.UI.ConsumableBuyUI)
+                    if CBU and CBU.enabled and CBU.enabled.get() then
+                        CBU.enabled.set(false)
+                        task.wait(0.2)
+                        CBU.enabled.set(true)
+                    end
+                end)
+                warn("[BS] ✓ Level bypass ON - all shop items unlocked on client")
+                warn("[BS]   Reopen the shop to see unlocked items")
+            end
+        end)
+    else
+        -- Restore original has_skill
+        pcall(function()
+            local SL = require(RS.Modules.Game.Skills.SkillsList)
+            if SL then
+                -- Can't easily restore, just reload would be needed
+                warn("[BS] Level bypass OFF - rejoin to fully restore")
+            end
+        end)
+    end
+end
+
+-- SHOP BUY (directly fires purchase_consumable for any item, bypassing UI)
+local function shopBuyItem(shopInstance, itemName)
+    if not GR then warn("[BS] No Get remote"); return end
+    local ok, result = pcall(function()
+        return nG("purchase_consumable", shopInstance, itemName)
+    end)
+    if ok and result then
+        warn("[BS] ✓ Purchased: " .. itemName)
+    else
+        warn("[BS] ✗ Failed to purchase: " .. itemName .. " (server rejected)")
     end
 end
 
@@ -449,52 +511,192 @@ Players.PlayerAdded:Connect(function(p) p.CharacterAdded:Connect(function() task
 Players.PlayerRemoving:Connect(function(p) clrE(p) end)
 for _,p in ipairs(Players:GetPlayers()) do if p~=lp then p.CharacterAdded:Connect(function() task.wait(1.5); refE(p) end) end end
 
--- JOBS
+-- JOBS (SMART FARMS with proper tool equipping + better target scanning)
 local jR={jan=false,atm=false,shelf=false,cook=false,farm=false,fish=false}
 local function stopAll() for k in pairs(jR) do jR[k]=false end; pathOn=false end
-local function janitorFarm() jR.jan=true; becomeJob("janitor"); while jR.jan do equipTool("mop")
-    local best,bd,bp=nil,9999,nil
-    pcall(function() for _,o in ipairs(workspace:GetDescendants()) do if o:IsA("ProximityPrompt") and o.Enabled then local p=o.Parent; if p then local n=p.Name:lower()
-        if n:find("spill") or n:find("puddle") or n:find("mop") or n:find("mess") then local h=getHRP(); if h then local d=(h.Position-p.Position).Magnitude; if d<bd then bd=d; best=p; bp=o end end end
-    end end end end)
-    if best and jR.jan then pathTo(best.Position,25); task.wait(0.3); pcall(function() fireproximityprompt(bp) end); task.wait(1.5) else task.wait(2) end end end
 
-local function atmFarm() jR.atm=true; while jR.atm do
-    local best,bd,bp=nil,9999,nil
-    pcall(function() for _,o in ipairs(workspace:GetDescendants()) do if o:IsA("ProximityPrompt") and o.ActionText=="Open ATM" and o.Enabled then
-        local p=o.Parent; local h=getHRP(); if h and p then local d=(h.Position-p.Position).Magnitude; if d<bd then bd=d; best=p; bp=o end end end end end)
-    if best and jR.atm then pathTo(best.Position,30); task.wait(0.5); pcall(function() fireproximityprompt(bp) end); task.wait(1)
-        local am=best; while am and am.Parent~=workspace do if am.Parent==nil then break end; am=am.Parent end
-        nS("request_begin_hacking_3",am); task.wait(math.random(30,50)/10); nS("atm_win_3",am); task.wait(3)
-    else task.wait(3) end end end
+-- Smart tool equip: tries multiple tool names, picks best available
+local function smartEquip(toolNames)
+    local bp = lp.Backpack
+    local ch = getChar()
+    if not bp or not ch then return end
+    -- Check if already holding one of these
+    for _,name in ipairs(toolNames) do
+        pcall(function()
+            for _,t in ipairs(ch:GetChildren()) do
+                if t:IsA("Tool") and t.Name:lower():find(name:lower()) then return end
+            end
+        end)
+    end
+    -- Try to equip best tool (later in list = better)
+    for i = #toolNames, 1, -1 do
+        pcall(function()
+            for _,t in ipairs(bp:GetChildren()) do
+                if t:IsA("Tool") and t.Name:lower():find(toolNames[i]:lower()) then
+                    local h = getHum()
+                    if h then h:EquipTool(t) end
+                    return
+                end
+            end
+        end)
+    end
+end
 
-local function shelfFarm() jR.shelf=true; becomeJob("shelf_stocker"); while jR.shelf do
-    local best,bd,bp=nil,9999,nil
-    pcall(function() for _,o in ipairs(workspace:GetDescendants()) do if o:IsA("ProximityPrompt") and o.Enabled then local p=o.Parent; if p then local n=p.Name:lower()
-        if n:find("box") or n:find("crate") or n:find("shelf") or n:find("stock") then local h=getHRP(); if h then local d=(h.Position-p.Position).Magnitude; if d<bd then bd=d; best=p; bp=o end end end
-    end end end end)
-    if best and jR.shelf then pathTo(best.Position,25); task.wait(0.3); pcall(function() fireproximityprompt(bp) end); task.wait(1.5) else task.wait(2) end end end
+-- Smart prompt finder: finds nearest ProximityPrompt matching criteria
+local function findPrompt(keywords, maxDist, actionFilter)
+    local best,bd,bp2=nil,maxDist or 999,nil
+    pcall(function()
+        for _,o in ipairs(workspace:GetDescendants()) do
+            if o:IsA("ProximityPrompt") and o.Enabled then
+                -- Action text filter
+                if actionFilter and o.ActionText ~= actionFilter then continue end
+                local p = o.Parent
+                if not p then continue end
+                local n = p.Name:lower()
+                local match = false
+                for _,kw in ipairs(keywords) do
+                    if n:find(kw:lower()) then match = true; break end
+                end
+                -- Also check parent's parent name
+                if not match and p.Parent then
+                    local pn = p.Parent.Name:lower()
+                    for _,kw in ipairs(keywords) do
+                        if pn:find(kw:lower()) then match = true; break end
+                    end
+                end
+                if match then
+                    local h = getHRP()
+                    if h then
+                        local d = (h.Position - p.Position).Magnitude
+                        if d < bd then bd = d; best = p; bp2 = o end
+                    end
+                end
+            end
+        end
+    end)
+    return best, bp2, bd
+end
 
-local function cookFarm() jR.cook=true; becomeJob("steakhouse_cook"); while jR.cook do equipTool("skillet")
-    local best,bd,bp=nil,9999,nil
-    pcall(function() for _,o in ipairs(workspace:GetDescendants()) do if o:IsA("ProximityPrompt") and o.Enabled then local p=o.Parent; if p then local n=p.Name:lower()
-        if n:find("stove") or n:find("grill") or n:find("cook") or n:find("order") or n:find("steak") then local h=getHRP(); if h then local d=(h.Position-p.Position).Magnitude; if d<bd then bd=d; best=p; bp=o end end end
-    end end end end)
-    if best and jR.cook then pathTo(best.Position,25); task.wait(0.3); pcall(function() fireproximityprompt(bp) end); task.wait(2) else task.wait(2) end end end
+-- JANITOR: equips best mop, finds spills
+local function janitorFarm() jR.jan=true; becomeJob("janitor")
+    task.wait(1)
+    while jR.jan do
+        smartEquip({"mop","Bronze Mop","Silver Mop","Gold Mop","Diamond Mop"})
+        local target, prompt = findPrompt(
+            {"spill","puddle","mess","mop","toxic","oil","nasty","large"}, 500
+        )
+        if target and jR.jan then
+            pathTo(target.Position, 25)
+            task.wait(0.3)
+            pcall(function() fireproximityprompt(prompt) end)
+            task.wait(1.5)
+        else
+            task.wait(2)
+        end
+    end
+end
 
-local function farmFarm() jR.farm=true; while jR.farm do
-    local best,bd,bp=nil,9999,nil
-    pcall(function() for _,o in ipairs(workspace:GetDescendants()) do if o:IsA("ProximityPrompt") and o.Enabled then local p=o.Parent; if p then local n=p.Name:lower()
-        if n:find("farm") or n:find("plot") or n:find("pot") or n:find("plant") or n:find("harvest") or n:find("water") then local h=getHRP(); if h then local d=(h.Position-p.Position).Magnitude; if d<bd then bd=d; best=p; bp=o end end end
-    end end end end)
-    if best and jR.farm then pathTo(best.Position,25); task.wait(0.3); pcall(function() fireproximityprompt(bp) end); task.wait(2) else task.wait(3) end end end
+-- ATM HACKER: finds ATMs, equips best hack tool, runs minigame
+local function atmFarm() jR.atm=true
+    task.wait(0.5)
+    while jR.atm do
+        smartEquip({"HackTool","BasicHackTool","HackToolPro","HackToolUltimate","HackToolQuantum"})
+        local target, prompt = findPrompt({"atm","ATM"}, 500, "Open ATM")
+        if target and jR.atm then
+            pathTo(target.Position, 30)
+            task.wait(0.5)
+            pcall(function() fireproximityprompt(prompt) end)
+            task.wait(1)
+            -- Walk up to find the ATM model
+            local am = target
+            while am and am.Parent ~= workspace do
+                if am.Parent == nil then break end
+                am = am.Parent
+            end
+            nS("request_begin_hacking_3", am)
+            task.wait(math.random(30,50)/10)
+            nS("atm_win_3", am)
+            task.wait(3)
+        else
+            task.wait(3)
+        end
+    end
+end
 
-local function fishFarm() jR.fish=true; while jR.fish do equipTool("fishing")
-    local best,bd,bp=nil,9999,nil
-    pcall(function() for _,o in ipairs(workspace:GetDescendants()) do if o:IsA("ProximityPrompt") and o.Enabled then local p=o.Parent; if p then local n=p.Name:lower()
-        if n:find("fish") or n:find("pier") or n:find("dock") or n:find("bait") then local h=getHRP(); if h then local d=(h.Position-p.Position).Magnitude; if d<bd then bd=d; best=p; bp=o end end end
-    end end end end)
-    if best and jR.fish then pathTo(best.Position,30); task.wait(0.5); pcall(function() fireproximityprompt(bp) end); task.wait(3) else task.wait(3) end end end
+-- SHELF STOCKER: finds crates/shelves
+local function shelfFarm() jR.shelf=true; becomeJob("shelf_stocker")
+    task.wait(1)
+    while jR.shelf do
+        local target, prompt = findPrompt(
+            {"box","crate","shelf","stock","pickup","restock","electronic"}, 500
+        )
+        if target and jR.shelf then
+            pathTo(target.Position, 25)
+            task.wait(0.3)
+            pcall(function() fireproximityprompt(prompt) end)
+            task.wait(1.5)
+        else
+            task.wait(2)
+        end
+    end
+end
+
+-- COOK: equips best skillet, finds stoves/orders
+local function cookFarm() jR.cook=true; becomeJob("steakhouse_cook")
+    task.wait(1)
+    while jR.cook do
+        smartEquip({"Skillet","BronzeSkillet","SilverSkillet","GoldenSkillet"})
+        local target, prompt = findPrompt(
+            {"stove","grill","cook","order","steak","pan","fry","plate","serve"}, 500
+        )
+        if target and jR.cook then
+            pathTo(target.Position, 25)
+            task.wait(0.3)
+            pcall(function() fireproximityprompt(prompt) end)
+            task.wait(2)
+        else
+            task.wait(2)
+        end
+    end
+end
+
+-- FARMING: equips watering can, finds pots/plots
+local function farmFarm() jR.farm=true
+    task.wait(0.5)
+    while jR.farm do
+        smartEquip({"WateringCan"})
+        local target, prompt = findPrompt(
+            {"farm","plot","pot","plant","harvest","water","soil","seed","grow"}, 500
+        )
+        if target and jR.farm then
+            pathTo(target.Position, 25)
+            task.wait(0.3)
+            pcall(function() fireproximityprompt(prompt) end)
+            task.wait(2)
+        else
+            task.wait(3)
+        end
+    end
+end
+
+-- FISHING: equips best rod, finds fishing spots
+local function fishFarm() jR.fish=true
+    task.wait(0.5)
+    while jR.fish do
+        smartEquip({"FishingRod","FishingRodRegular","FishingRodPro","FishingRodAdvanced","FishingRodUltimate"})
+        local target, prompt = findPrompt(
+            {"fish","pier","dock","bait","cast","rod","catch"}, 500
+        )
+        if target and jR.fish then
+            pathTo(target.Position, 30)
+            task.wait(0.5)
+            pcall(function() fireproximityprompt(prompt) end)
+            task.wait(3)
+        else
+            task.wait(3)
+        end
+    end
+end
 
 -- VEHICLE
 local function setVB(on) en.vb=on; kill("vb"); if on then conn("vb",RunService.Heartbeat,function() pcall(function()
@@ -520,7 +722,7 @@ task.spawn(function() local o=0; while sg.Parent do o=(o+0.005)%1; grd.Offset=Ve
 local topH=42; local top=Instance.new("Frame",win); top.Size=UDim2.new(1,0,0,topH); top.BackgroundColor3=Color3.fromRGB(18,5,5); top.BorderSizePixel=0; top.ZIndex=3; Instance.new("UICorner",top).CornerRadius=UDim.new(0,12)
 local dot=Instance.new("Frame",top); dot.Size=UDim2.fromOffset(8,8); dot.Position=UDim2.new(0,14,0.5,-4); dot.BackgroundColor3=Color3.fromRGB(230,50,50); dot.BorderSizePixel=0; dot.ZIndex=5; Instance.new("UICorner",dot).CornerRadius=UDim.new(1,0)
 task.spawn(function() while sg.Parent do TS:Create(dot,TweenInfo.new(0.8),{BackgroundTransparency=0.6}):Play(); task.wait(0.8); TS:Create(dot,TweenInfo.new(0.8),{BackgroundTransparency=0}):Play(); task.wait(0.8) end end)
-local tl=Instance.new("TextLabel",top); tl.Size=UDim2.new(1,-50,1,0); tl.Position=UDim2.new(0,28,0,0); tl.BackgroundTransparency=1; tl.Text="BlockSpin · v9.1"; tl.TextColor3=Color3.fromRGB(220,55,55); tl.Font=Enum.Font.GothamBold; tl.TextSize=14; tl.TextXAlignment=Enum.TextXAlignment.Left; tl.ZIndex=5
+local tl=Instance.new("TextLabel",top); tl.Size=UDim2.new(1,-50,1,0); tl.Position=UDim2.new(0,28,0,0); tl.BackgroundTransparency=1; tl.Text="BlockSpin · v10"; tl.TextColor3=Color3.fromRGB(220,55,55); tl.Font=Enum.Font.GothamBold; tl.TextSize=14; tl.TextXAlignment=Enum.TextXAlignment.Left; tl.ZIndex=5
 local mb=Instance.new("TextButton",top); mb.Size=UDim2.fromOffset(28,28); mb.Position=UDim2.new(1,-36,0.5,-14); mb.BackgroundColor3=Color3.fromRGB(30,10,10); mb.Text="−"; mb.TextColor3=Color3.fromRGB(200,200,200); mb.Font=Enum.Font.GothamBold; mb.TextSize=18; mb.BorderSizePixel=0; mb.ZIndex=6; Instance.new("UICorner",mb).CornerRadius=UDim.new(1,0)
 
 -- TABS
@@ -582,7 +784,9 @@ sec(sp,"Movement"); tog(sp,"Speed Boost","SpeedMultiplier (slider below)",setSpe
 sld(sp,"Speed",1,3,1.25,function(v) speedMult=v; if en.speed then pcall(function() lp:SetAttribute("SpeedMultiplier",v) end) end end)
 tog(sp,"Auto Sprint","Fires remote every 2s (not spammy)",setSprint)
 tog(sp,"No Clip","⚠ FLAG_ANTI_NOCLIP_CHECK is ON",setNoClip)
-sec(sp,"Quests"); act(sp,"⚡ Auto-Claim Quests",function() task.spawn(claimAll) end)
+sec(sp,"Quests & Shop")
+act(sp,"⚡ Auto-Claim ALL Quests",function() task.spawn(claimAll) end)
+tog(sp,"🔓 Level Bypass","Unlock all shop items (client-side)",setLevelBypass)
 sec(sp,"Teleport (no anti-tp!)")
 for name,_ in pairs(TP_SPOTS) do act(sp,"📍 "..name,function() task.spawn(function() teleportTo(name) end) end) end
 
